@@ -1,0 +1,110 @@
+from __future__ import unicode_literals, division, absolute_import, print_function
+
+__license__   = 'GPL v3'
+__copyright__ = '2024, IncrediblePineapple'
+
+import os
+try:
+    from qt.core import QUrl, QModelIndex
+except ImportError:
+    from PyQt5.Qt import QUrl, QModelIndex
+
+from calibre.gui2 import error_dialog
+from calibre.gui2.actions import InterfaceAction
+from calibre.ptempfile import PersistentTemporaryDirectory, remove_dir
+
+from calibre_plugins.collection_titles import ActionCollectionTitles
+from calibre_plugins.collection_titles.common_icons import set_plugin_icon_resources, get_icon
+from calibre_plugins.collection_titles.dialogs import (QueueProgressDialog, AddBooksProgressDialog)
+
+PLUGIN_ICONS = ['images/icon.png']
+
+class CollectionTitlesAction(InterfaceAction):
+
+  name = 'Collection title creation action'
+
+  action_spec = (_('Collection titles'), None, _('Insert collection titles into ePub metadata'), ())
+  action_type = 'current'
+
+  def genesis(self):
+    icon_resources = self.load_resources(PLUGIN_ICONS)
+    set_plugin_icon_resources(self.name, icon_resources)
+    self.qaction.setIcon(get_icon(PLUGIN_ICONS[0]))
+    self.qaction.triggered.connect(self.modify_epub)
+
+  def modify_epub(self):
+    rows = self.gui.library_view.selectionModel().selectedRows()
+    if not rows or len(rows) == 0:
+        return error_dialog(self.gui, _('Cannot modify ePub'),
+            _('You must select one or more books to perform this action.'), show=True)
+
+    book_ids = set(self.gui.library_view.get_selected_ids())
+    db = self.gui.library_view.model().db
+    book_epubs = []
+    for book_id in book_ids:
+        if db.has_format(book_id, 'EPUB', index_is_id=True):
+            book_epubs.append(book_id)
+
+    if not book_epubs:
+        return error_dialog(self.gui, _('Cannot modify ePub'),
+                _('No ePub available. First convert the book to ePub.'),
+                show=True)
+
+    tdir = PersistentTemporaryDirectory('_collection_titles', prefix='')
+    QueueProgressDialog(self.gui, book_epubs, tdir, self._queue_job, db)
+
+  def _queue_job(self, tdir, books_to_modify):
+    if not books_to_modify:
+        # All failed so cleanup our temp directory
+        remove_dir(tdir)
+        return
+
+    func = 'arbitrary_n'
+    cpus = self.gui.job_manager.server.pool_size
+    args = ['calibre_plugins.collection_titles.jobs', 'do_modify_epubs',
+            (books_to_modify, cpus)]
+    #desc = 'Collection titles version ' + str(ActionCollectionTitles.version)
+    job = self.gui.job_manager.run_job(
+            self.Dispatcher(self._modify_completed), func, args=args,
+                description="Inserting collection title")
+    job._tdir = tdir
+    self.gui.status_bar.show_message('Modifying %d books'%len(books_to_modify))
+  
+  def _modify_completed(self, job):
+    if job.failed:
+        self.gui.job_exception(job, dialog_title=_('Failed to modify ePubs'))
+        return
+    modified_epubs_map = job.result
+    self.gui.status_bar.show_message(_('Modify ePub completed'), 3000)
+
+    update_count = len(modified_epubs_map)
+    if update_count == 0:
+        msg = _("No ePub files were updated. If this isn't what you expected "
+                "then press the Show details button to check for errors in the log.")
+        return error_dialog(self.gui, _("Modify ePub changed no files"), msg,
+                            show_copy_button=True, show=True,
+                            det_msg=job.details)
+
+    payload = (modified_epubs_map, job._tdir)
+
+    # if cfg.plugin_prefs[cfg.STORE_NAME].get(cfg.KEY_ASK_FOR_CONFIRMATION,
+    #                                         cfg.DEFAULT_STORE_VALUES[cfg.KEY_ASK_FOR_CONFIRMATION]):
+    #     msg = '<p>'+_('Modify ePub modified <b>%d ePub files(s)</b> into a temporary location. '
+    #            'Proceed with replacing the versions in your library?') % update_count
+
+    #     self.gui.proceed_question(self._proceed_with_updating_epubs,
+    #         payload, job.details,
+    #         _('Modify log'), _('Modify ePub complete'), msg,
+    #         show_copy_button=False,
+    #         cancel_callback=self._cancel_updating_epubs)
+    # else:
+    self._proceed_with_updating_epubs(payload)
+
+  def _proceed_with_updating_epubs(self, payload):
+    modified_epubs_map, tdir = payload
+    AddBooksProgressDialog(self.gui, modified_epubs_map, tdir)
+    self.gui.tags_view.recount()
+    if self.gui.current_view() is self.gui.library_view:
+        current = self.gui.library_view.currentIndex()
+        if current.isValid():
+            self.gui.library_view.model().current_changed(current, QModelIndex())
